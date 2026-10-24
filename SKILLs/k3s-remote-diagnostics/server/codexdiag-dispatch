@@ -1,0 +1,204 @@
+#!/usr/bin/env bash
+set -euo pipefail
+set -f
+
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+KUBECONFIG=/home/codexdiag/.kube/config
+
+readonly ALLOWED_READ_ROOTS=(
+  "/etc/rancher/k3s/config.yaml"
+  "/var/lib/rancher/k3s/server/audit-policy.yaml"
+  "/var/lib/rancher/k3s/server/manifests"
+  "/opt/k3s-audit"
+  "/opt/install/mywebs_install"
+)
+
+fail() {
+  printf 'Denied: %s\n' "$*" >&2
+  exit 126
+}
+
+usage() {
+  cat <<'USAGE'
+Allowed commands:
+  kube <read-only kubectl command and arguments>
+  journal [duration] [lines]
+  read <path> [start-line] [line-count]
+  find <allowed-root> [max-depth]
+  status
+  resources
+  ports
+  dns <hostname>
+  tls <hostname> [port]
+  help
+
+Examples:
+  ssh myk3s-ro kube get pods -A -o wide
+  ssh myk3s-ro kube describe pod POD -n NAMESPACE
+  ssh myk3s-ro kube logs POD -n NAMESPACE --all-containers --tail=500
+  ssh myk3s-ro journal 2h 1000
+  ssh myk3s-ro read /etc/rancher/k3s/config.yaml
+USAGE
+}
+
+is_uint() {
+  [[ "$1" =~ ^[0-9]+$ ]]
+}
+
+is_duration() {
+  [[ "$1" =~ ^[0-9]+(s|m|h|d)$ ]]
+}
+
+is_hostname() {
+  [[ "$1" =~ ^[A-Za-z0-9.-]+$ ]]
+}
+
+is_allowed_path() {
+  local requested="$1"
+  local resolved root
+
+  resolved="$(realpath -e -- "$requested" 2>/dev/null)" || return 1
+
+  for root in "${ALLOWED_READ_ROOTS[@]}"; do
+    if [[ -f "$root" ]]; then
+      [[ "$resolved" == "$(realpath -e -- "$root")" ]] && return 0
+    elif [[ -d "$root" ]]; then
+      root="$(realpath -e -- "$root")"
+      [[ "$resolved" == "$root" || "$resolved" == "$root/"* ]] && return 0
+    fi
+  done
+
+  return 1
+}
+
+reject_kube_overrides() {
+  local arg
+  for arg in "$@"; do
+    case "$arg" in
+      --kubeconfig|--kubeconfig=*|--token|--token=*|--server|--server=*|\
+      --user|--user=*|--context|--context=*|--as|--as=*|\
+      --as-group|--as-group=*|--client-key|--client-key=*|\
+      --client-certificate|--client-certificate=*|\
+      --certificate-authority|--certificate-authority=*|\
+      --insecure-skip-tls-verify|--insecure-skip-tls-verify=*|\
+      --proxy-url|--proxy-url=*)
+        fail "Kubernetes identity or endpoint override is not allowed"
+        ;;
+      -w|--watch|--watch=*|-f|--follow|--follow=*)
+        fail "Streaming output is disabled; request a bounded snapshot"
+        ;;
+    esac
+  done
+}
+
+run_kube() {
+  (($# > 0)) || fail "Missing kubectl command"
+  reject_kube_overrides "$@"
+
+  local command="$1"
+  shift
+
+  case "$command" in
+    get|describe|logs|top|api-resources|api-versions|explain|version|cluster-info|events)
+      ;;
+    auth)
+      [[ "${1:-}" == "can-i" || "${1:-}" == "whoami" ]] || fail "Only auth can-i and auth whoami are allowed"
+      ;;
+    rollout)
+      [[ "${1:-}" == "status" || "${1:-}" == "history" ]] || fail "Only rollout status/history are allowed"
+      ;;
+    *)
+      fail "kubectl command '$command' is not read-only or is not allowlisted"
+      ;;
+  esac
+
+  local arg
+  for arg in "$@"; do
+    case "$arg" in
+      secret|secrets|secret/*|secrets/*|*.secret|*.secrets)
+        fail "Reading Kubernetes Secrets is disabled to prevent credential-based RBAC bypass"
+        ;;
+    esac
+  done
+
+  exec /usr/local/bin/k3s kubectl --kubeconfig="$KUBECONFIG" "$command" "$@"
+}
+
+run_journal() {
+  local duration="${1:-2h}"
+  local lines="${2:-1000}"
+
+  is_duration "$duration" || fail "Duration must look like 30m, 2h, or 1d"
+  is_uint "$lines" || fail "Line count must be numeric"
+  ((lines >= 1 && lines <= 5000)) || fail "Line count must be between 1 and 5000"
+
+  exec journalctl -u k3s --since="-$duration" --no-pager -n "$lines" -o short-iso
+}
+
+run_read() {
+  (($# >= 1)) || fail "Missing path"
+  local path="$1"
+  local start="${2:-1}"
+  local count="${3:-1200}"
+
+  is_allowed_path "$path" || fail "Path is outside the read allowlist or does not exist"
+  [[ -f "$path" ]] || fail "Path is not a regular file"
+  is_uint "$start" || fail "Start line must be numeric"
+  is_uint "$count" || fail "Line count must be numeric"
+  ((start >= 1 && count >= 1 && count <= 5000)) || fail "Invalid line range"
+
+  local end=$((start + count - 1))
+  exec sed -n "${start},${end}p" -- "$path"
+}
+
+run_find() {
+  (($# >= 1)) || fail "Missing root path"
+  local root="$1"
+  local depth="${2:-4}"
+
+  is_allowed_path "$root" || fail "Path is outside the read allowlist or does not exist"
+  [[ -d "$root" ]] || fail "Path is not a directory"
+  is_uint "$depth" || fail "Max depth must be numeric"
+  ((depth >= 1 && depth <= 8)) || fail "Max depth must be between 1 and 8"
+
+  exec find "$root" -maxdepth "$depth" -type f -printf '%p\n'
+}
+
+run_tls() {
+  (($# >= 1)) || fail "Missing hostname"
+  local host="$1"
+  local port="${2:-443}"
+
+  is_hostname "$host" || fail "Invalid hostname"
+  is_uint "$port" || fail "Port must be numeric"
+  ((port >= 1 && port <= 65535)) || fail "Invalid port"
+
+  exec timeout 15 openssl s_client \
+    -connect "$host:$port" \
+    -servername "$host" \
+    -showcerts \
+    -verify_return_error
+}
+
+original="${SSH_ORIGINAL_COMMAND:-help}"
+read -r -a argv <<< "$original"
+command="${argv[0]:-help}"
+args=("${argv[@]:1}")
+
+case "$command" in
+  kube)      run_kube "${args[@]}" ;;
+  journal)   run_journal "${args[@]}" ;;
+  read)      run_read "${args[@]}" ;;
+  find)      run_find "${args[@]}" ;;
+  status)    exec systemctl status k3s --no-pager -l ;;
+  resources) exec sh -c 'uptime; printf "\n--- memory ---\n"; free -h; printf "\n--- disk ---\n"; df -hT' ;;
+  ports)     exec ss -lntup ;;
+  dns)
+    ((${#args[@]} == 1)) || fail "Usage: dns <hostname>"
+    is_hostname "${args[0]}" || fail "Invalid hostname"
+    exec getent ahosts "${args[0]}"
+    ;;
+  tls)       run_tls "${args[@]}" ;;
+  help|'')   usage ;;
+  *)         fail "Unknown command '$command'" ;;
+esac

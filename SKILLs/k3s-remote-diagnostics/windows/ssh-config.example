@@ -1,0 +1,9 @@
+Host myk3s-ro
+    HostName YOUR_SERVER_IP_OR_DNS
+    User codexdiag
+    IdentityFile ~/.ssh/id_ed25519_codex_k3s
+    IdentitiesOnly yes
+    BatchMode yes
+    ConnectTimeout 10
+    ServerAliveInterval 30
+    ServerAliveCountMax 2

@@ -1,0 +1,11 @@
+# Insert this rule near the beginning of the existing audit policy.
+# It records bounded read requests made with the diagnostics ServiceAccount.
+# Deliberately omit watch to avoid excessive audit volume.
+- level: Metadata
+  users:
+    - system:serviceaccount:kube-system:codex-diagnostics
+  verbs:
+    - get
+    - list
+  omitStages:
+    - RequestReceived
